@@ -2356,6 +2356,23 @@ TEST_F(MetricAggregatorTests, HistogramAggregationCumulative) {
   EXPECT_EQ(dp3->count_, 6);
 }
 
+TEST_F(MetricAggregatorTests, HistogramBucketsMatchExactSampleCount) {
+  setupAggregator(/*counter_temp=*/AggregationTemporality::AGGREGATION_TEMPORALITY_CUMULATIVE,
+                  /*hist_temp=*/AggregationTemporality::AGGREGATION_TEMPORALITY_CUMULATIVE);
+
+  mockHistogram({10, 20}, {4, 3}, 5, 50);
+  metric_aggregator_->addHistogram("metric", custom_stats_, {});
+
+  auto metrics = releaseSinkResourceResult();
+  const auto* histogram = getHistogramPoint(metrics, "metric", {});
+  ASSERT_NE(histogram, nullptr);
+  ASSERT_EQ(histogram->bucket_counts_.size(), 3);
+  EXPECT_EQ(histogram->count_, 5);
+  EXPECT_EQ(histogram->bucket_counts_[0] + histogram->bucket_counts_[1] +
+                histogram->bucket_counts_[2],
+            histogram->count_);
+}
+
 TEST_F(MetricAggregatorTests, HistogramAggregationDelta) {
   MetricAggregator::SortedAttributesVector attr1 = {{"key1", ""}};
 

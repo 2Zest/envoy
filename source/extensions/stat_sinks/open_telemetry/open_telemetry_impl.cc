@@ -21,6 +21,31 @@ using HistogramDataPoint = opentelemetry::proto::metrics::v1::HistogramDataPoint
 using KeyValue = opentelemetry::proto::common::v1::KeyValue;
 using Resource = opentelemetry::proto::resource::v1::Resource;
 
+// circllhist's bucket queries are approximate, while sampleCount() is exact. Reconcile the
+// approximate buckets before exporting so the OTLP invariant count == sum(bucket_counts) holds.
+void reconcileHistogramBuckets(std::vector<uint64_t>& bucket_counts, uint64_t sample_count) {
+  uint64_t bucket_sum = 0;
+  for (uint64_t count : bucket_counts) {
+    bucket_sum += count;
+  }
+  if (bucket_sum < sample_count) {
+    if (!bucket_counts.empty()) {
+      bucket_counts.back() += sample_count - bucket_sum;
+    }
+    return;
+  }
+  if (bucket_sum == sample_count) {
+    return;
+  }
+
+  uint64_t excess = bucket_sum - sample_count;
+  for (auto it = bucket_counts.rbegin(); it != bucket_counts.rend() && excess != 0; ++it) {
+    const uint64_t reduction = std::min(*it, excess);
+    *it -= reduction;
+    excess -= reduction;
+  }
+}
+
 ResourceRegistry::ResourceRegistry(const Protobuf::RepeatedPtrField<KeyValue>& sink_attributes) {
   *resources_.emplace_back().mutable_attributes() = sink_attributes;
 }
@@ -128,15 +153,16 @@ void MetricAggregator::addHistogram(std::string&& metric_name,
   auto it = histogram_data.find(key);
   if (it != histogram_data.end()) {
     std::vector<uint64_t> new_bucket_counts = stats.computeDisjointBuckets();
+    new_bucket_counts.push_back(stats.outOfBoundCount());
+    reconcileHistogramBuckets(new_bucket_counts, stats.sampleCount());
     auto& existing_point = it->second;
     if (existing_point.explicit_bounds_ == stats.supportedBuckets() &&
-        existing_point.bucket_counts_.size() == new_bucket_counts.size() + 1) {
+        existing_point.bucket_counts_.size() == new_bucket_counts.size()) {
       existing_point.count_ += stats.sampleCount();
       existing_point.sum_ += stats.sampleSum();
       for (size_t i = 0; i < new_bucket_counts.size(); ++i) {
         existing_point.bucket_counts_[i] += new_bucket_counts[i];
       }
-      existing_point.bucket_counts_.back() += stats.outOfBoundCount();
     } else {
       ENVOY_LOG(error, "Histogram bounds mismatch for metric {} aggregated from stat", key.name());
     }
@@ -146,6 +172,7 @@ void MetricAggregator::addHistogram(std::string&& metric_name,
     custom_hist.sum_ = stats.sampleSum();
     custom_hist.bucket_counts_ = stats.computeDisjointBuckets();
     custom_hist.bucket_counts_.push_back(stats.outOfBoundCount());
+    reconcileHistogramBuckets(custom_hist.bucket_counts_, custom_hist.count_);
     custom_hist.explicit_bounds_ = stats.supportedBuckets();
     histogram_data.emplace(std::move(key), std::move(custom_hist));
   }
@@ -302,6 +329,7 @@ void RequestStreamer::addHistogram(std::string&& name,
   custom_hist.sum_ = stats.sampleSum();
   custom_hist.bucket_counts_ = stats.computeDisjointBuckets();
   custom_hist.bucket_counts_.push_back(stats.outOfBoundCount());
+  reconcileHistogramBuckets(custom_hist.bucket_counts_, custom_hist.count_);
   custom_hist.explicit_bounds_ = stats.supportedBuckets();
   addHistogram(std::move(name), std::move(custom_hist), std::move(attributes), resource_index);
 }
